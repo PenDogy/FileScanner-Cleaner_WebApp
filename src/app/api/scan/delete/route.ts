@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
-import { scanStates } from "@/lib/scanner";
+import { scanStates, isPathProtected } from "@/lib/scanner";
 
 export async function POST(request: NextRequest) {
   try {
@@ -22,11 +22,36 @@ export async function POST(request: NextRequest) {
     }[] = [];
 
     let totalFreed = 0;
+    let blockedCount = 0;
 
     for (const filePath of files) {
       try {
         // Security check: make sure path is not trying to escape
         const resolved = path.resolve(filePath);
+
+        // *** PROTECTION CHECK — Block deletion of system files ***
+        const protection = isPathProtected(resolved);
+        if (protection.protected) {
+          blockedCount++;
+          results.push({
+            file: resolved,
+            success: false,
+            error: `🛡️ ป้องกัน: ${protection.reason || "ไฟล์ระบบ — ห้ามลบ"}`,
+          });
+          continue;
+        }
+
+        // Extra safety: block .sys, .drv, .dll, .efi files on Windows
+        const ext = path.extname(resolved).toLowerCase();
+        if (process.platform === "win32" && [".sys", ".drv", ".dll", ".efi", ".mui"].includes(ext)) {
+          blockedCount++;
+          results.push({
+            file: resolved,
+            success: false,
+            error: "🛡️ ป้องกัน: ไฟล์ระบบ Windows — ห้ามลบ",
+          });
+          continue;
+        }
 
         // Check file exists
         if (!fs.existsSync(resolved)) {
@@ -72,6 +97,7 @@ export async function POST(request: NextRequest) {
       totalFreed,
       successCount: results.filter((r) => r.success).length,
       failCount: results.filter((r) => !r.success).length,
+      blockedCount,
     });
   } catch (error) {
     console.error("Error deleting files:", error);

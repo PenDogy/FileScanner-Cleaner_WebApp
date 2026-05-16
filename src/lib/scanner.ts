@@ -13,6 +13,8 @@ export interface FileInfo {
   daysSinceModified: number;
   extension: string;
   type: string;
+  isProtected: boolean;
+  protectionReason?: string;
 }
 
 export interface ScanState {
@@ -39,6 +41,161 @@ export interface ScanOptions {
 const scanStates = new Map<string, ScanState>();
 let activeScan: AbortController | null = null;
 
+// ============================================================
+// PROTECTED PATHS — ไฟล์/โฟลเดอร์ที่ห้ามลบเด็ดขาด
+// ============================================================
+
+// Windows system directories (case-insensitive match on C: drive)
+const WINDOWS_PROTECTED_DIRS = [
+  "Windows",
+  "Program Files",
+  "Program Files (x86)",
+  "ProgramData",
+  "System Volume Information",
+  "$Recycle.Bin",
+  "$WINDOWS.~BT",
+  "$WINDOWS.~WS",
+  "Recovery",
+  "Boot",
+  "EFI",
+  "Microsoft",
+  "PerfLogs",
+];
+
+// Linux/macOS system directories
+const LINUX_PROTECTED_DIRS = [
+  "/bin",
+  "/sbin",
+  "/usr",
+  "/etc",
+  "/var",
+  "/sys",
+  "/proc",
+  "/dev",
+  "/boot",
+  "/lib",
+  "/lib64",
+  "/run",
+  "/snap",
+  "/srv",
+];
+
+// Critical Windows file names that should NEVER be deleted
+const WINDOWS_CRITICAL_FILES = [
+  "ntldr",
+  "NTDETECT.COM",
+  "bootmgr",
+  "BOOTSECT.BAK",
+  "hiberfil.sys",
+  "pagefile.sys",
+  "swapfile.sys",
+  "config.sys",
+  "autoexec.bat",
+  "io.sys",
+  "msdos.sys",
+  "ntoskrnl.exe",
+  "hal.dll",
+  "winload.exe",
+  "winresume.exe",
+  "boot.ini",
+  "BCD",
+];
+
+// Critical file extensions that are system-related
+const SYSTEM_CRITICAL_EXTENSIONS = [
+  ".sys",
+  ".drv",
+  ".dll",
+  ".efi",
+  ".mui",
+];
+
+/**
+ * Check if a file/directory path is protected and should not be deleted
+ */
+function isPathProtected(fullPath: string): { protected: boolean; reason?: string } {
+  const normalized = path.normalize(fullPath);
+  const lower = normalized.toLowerCase();
+
+  // --- Windows checks ---
+  if (process.platform === "win32") {
+    // Check if on C: drive (system drive)
+    const isCDrive = /^[cC]:/.test(normalized);
+    if (isCDrive) {
+      // Check protected Windows directories
+      for (const dir of WINDOWS_PROTECTED_DIRS) {
+        const protectedPath = `C:\\${dir.toLowerCase()}\\`;
+        if (lower.startsWith(protectedPath) || lower.includes(`\\${dir.toLowerCase()}\\`)) {
+          return {
+            protected: true,
+            reason: `📁 อยู่ในโฟลเดอร์ระบบ Windows: ${dir}`,
+          };
+        }
+      }
+
+      // Check critical files at root of C:
+      const fileName = path.basename(normalized).toLowerCase();
+      for (const criticalFile of WINDOWS_CRITICAL_FILES) {
+        if (fileName === criticalFile.toLowerCase()) {
+          return {
+            protected: true,
+            reason: `⚠️ ไฟล์ระบบสำคัญ: ${path.basename(normalized)}`,
+          };
+        }
+      }
+
+      // Check system critical extensions anywhere on C:
+      const ext = path.extname(lower);
+      if (SYSTEM_CRITICAL_EXTENSIONS.includes(ext)) {
+        return {
+          protected: true,
+          reason: `🔒 นามสกุลไฟล์ระบบ: ${ext}`,
+        };
+      }
+
+      // Check Users directory — protect user profile root
+      const usersMatch = lower.match(/^c:\\users\\[^\\]+$/);
+      if (usersMatch) {
+        return {
+          protected: true,
+          reason: "👤 โฟลเดอร์โปรไฟล์ผู้ใช้",
+        };
+      }
+
+      // Protect AppData system folders
+      if (lower.includes("\\appdata\\local\\microsoft\\windows")) {
+        return {
+          protected: true,
+          reason: "📁 อยู่ในโฟลเดอร์ AppData ระบบ Windows",
+        };
+      }
+    }
+  }
+
+  // --- Linux/macOS checks ---
+  if (process.platform !== "win32") {
+    for (const dir of LINUX_PROTECTED_DIRS) {
+      if (lower.startsWith(dir.toLowerCase() + "/") || lower === dir.toLowerCase()) {
+        return {
+          protected: true,
+          reason: `📁 อยู่ในโฟลเดอร์ระบบ: ${dir}`,
+        };
+      }
+    }
+
+    // Protect kernel and system files
+    const fileName = path.basename(normalized);
+    if (fileName.startsWith("vmlinuz") || fileName.startsWith("initrd") || fileName.startsWith("System.map")) {
+      return {
+        protected: true,
+        reason: "⚠️ ไฟล์เคอร์เนล/ระบบ",
+      };
+    }
+  }
+
+  return { protected: false };
+}
+
 function getFileCategory(ext: string): string {
   const categories: Record<string, string[]> = {
     "Temp Files": [".tmp", ".temp", ".bak", ".old", ".swp", ".swo", ".cache"],
@@ -63,8 +220,8 @@ function getFileCategory(ext: string): string {
   return "Other";
 }
 
-function getDrives(): { path: string; label: string; total: number; free: number }[] {
-  const drives: { path: string; label: string; total: number; free: number }[] = [];
+function getDrives(): { path: string; label: string; total: number; free: number; isSystemDrive: boolean }[] {
+  const drives: { path: string; label: string; total: number; free: number; isSystemDrive: boolean }[] = [];
 
   if (process.platform === "win32") {
     // Windows: check A-Z drives
@@ -74,11 +231,13 @@ function getDrives(): { path: string; label: string; total: number; free: number
         const stats = fs.statSync(drivePath);
         if (stats) {
           const diskInfo = getDiskInfo(drivePath);
+          const isSystemDrive = letter === "C";
           drives.push({
             path: drivePath,
-            label: `Drive ${letter}:`,
+            label: isSystemDrive ? `Drive ${letter}: (System)` : `Drive ${letter}:`,
             total: diskInfo.total,
             free: diskInfo.free,
+            isSystemDrive,
           });
         }
       } catch {
@@ -90,9 +249,10 @@ function getDrives(): { path: string; label: string; total: number; free: number
     const rootInfo = getDiskInfo("/");
     drives.push({
       path: "/",
-      label: "Root (/)",
+      label: "Root (/) [System]",
       total: rootInfo.total,
       free: rootInfo.free,
+      isSystemDrive: true,
     });
 
     // Check common mount points
@@ -110,6 +270,7 @@ function getDrives(): { path: string; label: string; total: number; free: number
               label: mp,
               total: info.total,
               free: info.free,
+              isSystemDrive: false,
             });
           }
         }
@@ -128,6 +289,7 @@ function getDrives(): { path: string; label: string; total: number; free: number
           label: `Home (${homeDir})`,
           total: homeInfo.total,
           free: homeInfo.free,
+          isSystemDrive: false,
         });
       }
     }
@@ -156,6 +318,25 @@ function formatBytes(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 
+// Directories to skip entirely during scan (system-critical, no useful files to clean)
+const SKIP_DIRECTORIES = new Set([
+  // Windows
+  "Windows",
+  "$Recycle.Bin",
+  "$WINDOWS.~BT",
+  "$WINDOWS.~WS",
+  "System Volume Information",
+  "Recovery",
+  "Boot",
+  "EFI",
+  "Microsoft",
+  "PerfLogs",
+  // Cross-platform
+  "node_modules",
+  "__pycache__",
+  ".git",
+]);
+
 async function scanDirectory(
   dirPath: string,
   options: ScanOptions,
@@ -183,8 +364,8 @@ async function scanDirectory(
 
     try {
       if (entry.isDirectory()) {
-        // Skip hidden directories, node_modules, .git, etc.
-        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "__pycache__") {
+        // Skip hidden directories and system-critical directories
+        if (entry.name.startsWith(".") || SKIP_DIRECTORIES.has(entry.name)) {
           continue;
         }
         await scanDirectory(fullPath, options, scanState, depth + 1, signal);
@@ -223,6 +404,9 @@ async function scanDirectory(
           continue;
         }
 
+        // Check if file is protected
+        const protection = isPathProtected(fullPath);
+
         const fileInfo: FileInfo = {
           id: Buffer.from(fullPath).toString("base64url"),
           name: entry.name,
@@ -234,6 +418,8 @@ async function scanDirectory(
           daysSinceModified,
           extension: ext || "(no ext)",
           type: getFileCategory(ext),
+          isProtected: protection.protected,
+          protectionReason: protection.reason,
         };
 
         scanState.filesFound.push(fileInfo);
@@ -252,4 +438,9 @@ export {
   activeScan,
   getFileCategory,
   getDiskInfo,
+  isPathProtected,
+  WINDOWS_PROTECTED_DIRS,
+  LINUX_PROTECTED_DIRS,
+  WINDOWS_CRITICAL_FILES,
+  SYSTEM_CRITICAL_EXTENSIONS,
 };

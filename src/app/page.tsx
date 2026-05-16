@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect } from "react";
 import {
   HardDrive,
   Search,
@@ -15,22 +15,21 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
-  Info,
   Settings2,
   BarChart3,
   Shield,
+  ShieldAlert,
+  Lock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -49,9 +48,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
-import { Switch } from "@/components/ui/switch";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -77,6 +74,7 @@ interface DriveInfo {
   label: string;
   total: number;
   free: number;
+  isSystemDrive?: boolean;
 }
 
 interface FileInfo {
@@ -90,6 +88,8 @@ interface FileInfo {
   daysSinceModified: number;
   extension: string;
   type: string;
+  isProtected: boolean;
+  protectionReason?: string;
 }
 
 interface ScanStatus {
@@ -111,14 +111,6 @@ function formatBytes(bytes: number): string {
   const sizes = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-}
-
-function formatDate(isoString: string): string {
-  return new Date(isoString).toLocaleDateString("th-TH", {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
 }
 
 function getDaysColor(days: number): string {
@@ -204,9 +196,16 @@ export default function Home() {
           clearInterval(interval);
 
           if (data.status === "completed") {
+            const protectedCount = data.filesFound.filter(
+              (f: FileInfo) => f.isProtected
+            ).length;
             toast({
               title: "สแกนเสร็จสิ้น!",
-              description: `พบไฟล์ที่ไม่ได้ใช้ ${data.filesFound.length} ไฟล์ จากทั้งหมด ${data.totalScanned} ไฟล์ที่สแกน`,
+              description: `พบไฟล์ ${data.filesFound.length} ไฟล์ จาก ${data.totalScanned} ไฟล์ที่สแกน${
+                protectedCount > 0
+                  ? ` (🛡️ ${protectedCount} ไฟล์ถูกป้องกัน)`
+                  : ""
+              }`,
             });
           } else {
             toast({
@@ -276,7 +275,7 @@ export default function Home() {
     }
   };
 
-  // Delete selected files
+  // Delete selected files (only non-protected)
   const deleteSelected = async () => {
     if (selectedFiles.size === 0) return;
 
@@ -293,11 +292,18 @@ export default function Home() {
 
       const data = await res.json();
 
-      toast({
-        title: "ลบไฟล์เสร็จสิ้น",
-        description: `ลบสำเร็จ ${data.successCount} ไฟล์ | ล้มเหลว ${data.failCount} ไฟล์ | ปล่อยพื้นที่ ${formatBytes(data.totalFreed)}`,
-        variant: data.failCount > 0 ? "destructive" : "default",
-      });
+      if (data.blockedCount > 0) {
+        toast({
+          title: "ลบไฟล์เสร็จสิ้น (มีไฟล์ถูกป้องกัน)",
+          description: `ลบสำเร็จ ${data.successCount} ไฟล์ | ถูกป้องกัน ${data.blockedCount} ไฟล์ | ปล่อยพื้นที่ ${formatBytes(data.totalFreed)}`,
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "ลบไฟล์เสร็จสิ้น",
+          description: `ลบสำเร็จ ${data.successCount} ไฟล์ | ปล่อยพื้นที่ ${formatBytes(data.totalFreed)}`,
+        });
+      }
 
       // Refresh scan status
       setSelectedFiles(new Set());
@@ -337,8 +343,9 @@ export default function Home() {
     setSelectAllDrives(!selectAllDrives);
   };
 
-  // File selection
-  const toggleFile = (filePath: string) => {
+  // File selection — block protected files
+  const toggleFile = (filePath: string, isProtected: boolean) => {
+    if (isProtected) return; // Can't select protected files
     setSelectedFiles((prev) => {
       const next = new Set(prev);
       if (next.has(filePath)) {
@@ -351,10 +358,14 @@ export default function Home() {
   };
 
   const toggleAllFiles = () => {
-    if (selectedFiles.size === filteredFiles.length) {
+    const selectableFiles = filteredFiles.filter((f) => !f.isProtected);
+    if (
+      selectedFiles.size === selectableFiles.length &&
+      selectableFiles.length > 0
+    ) {
       setSelectedFiles(new Set());
     } else {
-      setSelectedFiles(new Set(filteredFiles.map((f) => f.path)));
+      setSelectedFiles(new Set(selectableFiles.map((f) => f.path)));
     }
   };
 
@@ -439,13 +450,19 @@ export default function Home() {
   const stats = React.useMemo(() => {
     if (!scanStatus?.filesFound) return null;
 
-    const files = typeFilter === "all"
-      ? scanStatus.filesFound
-      : scanStatus.filesFound.filter((f) => f.type === typeFilter);
+    const files =
+      typeFilter === "all"
+        ? scanStatus.filesFound
+        : scanStatus.filesFound.filter((f) => f.type === typeFilter);
 
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
     const selectedSize = files
       .filter((f) => selectedFiles.has(f.path))
+      .reduce((sum, f) => sum + f.size, 0);
+
+    const protectedCount = files.filter((f) => f.isProtected).length;
+    const protectedSize = files
+      .filter((f) => f.isProtected)
       .reduce((sum, f) => sum + f.size, 0);
 
     const typeCounts: Record<string, number> = {};
@@ -457,6 +474,8 @@ export default function Home() {
       totalFiles: files.length,
       totalSize,
       selectedSize,
+      protectedCount,
+      protectedSize,
       typeCounts,
     };
   }, [scanStatus?.filesFound, selectedFiles, typeFilter]);
@@ -520,6 +539,23 @@ export default function Home() {
         </header>
 
         <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+          {/* Protection Info Banner */}
+          <Card className="border-0 shadow-md bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/20 dark:to-orange-950/20 border-l-4 border-l-amber-400">
+            <CardContent className="py-3 px-4">
+              <div className="flex items-center gap-3">
+                <ShieldAlert className="h-5 w-5 text-amber-500 flex-shrink-0" />
+                <div className="text-sm">
+                  <span className="font-semibold text-amber-700 dark:text-amber-400">
+                    ป้องกันระบบ:
+                  </span>{" "}
+                  <span className="text-amber-600 dark:text-amber-300">
+                    โปรแกรมจะป้องกันไม่ให้ลบไฟล์ระบบ Windows และโฟลเดอร์สำคัญ เช่น Windows, Program Files, System32 ไฟล์เหล่านี้จะแสดงเครื่องหมาย 🛡️ และไม่สามารถเลือกลบได้
+                  </span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
           {/* Step 1: Drive Selection */}
           <Card className="border-0 shadow-md">
             <CardHeader className="pb-3">
@@ -528,7 +564,9 @@ export default function Home() {
                   1
                 </div>
                 <div>
-                  <CardTitle className="text-lg">เลือก Drive / โฟลเดอร์</CardTitle>
+                  <CardTitle className="text-lg">
+                    เลือก Drive / โฟลเดอร์
+                  </CardTitle>
                   <CardDescription>
                     เลือกพื้นที่ที่ต้องการสแกนหรือกดสแกนทั้งหมด
                   </CardDescription>
@@ -539,52 +577,81 @@ export default function Home() {
               <div className="flex items-center gap-3 pb-2">
                 <Checkbox
                   id="selectAll"
-                  checked={selectAllDrives || selectedDrives.length === drives.length}
+                  checked={
+                    selectAllDrives ||
+                    selectedDrives.length === drives.length
+                  }
                   onCheckedChange={toggleSelectAll}
                 />
-                <Label htmlFor="selectAll" className="font-medium cursor-pointer">
+                <Label
+                  htmlFor="selectAll"
+                  className="font-medium cursor-pointer"
+                >
                   เลือกทั้งหมด
                 </Label>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {drives.map((drive) => (
-                  <button
-                    key={drive.path}
-                    onClick={() => toggleDrive(drive.path)}
-                    className={`flex items-center gap-3 p-4 rounded-xl border-2 transition-all duration-200 text-left hover:shadow-md ${
-                      selectedDrives.includes(drive.path) || (selectAllDrives && selectedDrives.length === drives.length)
-                        ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/20 shadow-sm"
-                        : "border-border bg-card hover:border-emerald-300"
-                    }`}
-                  >
-                    <div
-                      className={`p-2 rounded-lg ${
-                        selectedDrives.includes(drive.path) || (selectAllDrives && selectedDrives.length === drives.length)
-                          ? "bg-emerald-500 text-white"
-                          : "bg-muted text-muted-foreground"
+                {drives.map((drive) => {
+                  const isSelected =
+                    selectedDrives.includes(drive.path) ||
+                    (selectAllDrives &&
+                      selectedDrives.length === drives.length);
+                  return (
+                    <button
+                      key={drive.path}
+                      onClick={() => toggleDrive(drive.path)}
+                      className={`flex items-center gap-3 p-4 rounded-xl border-2 transition-all duration-200 text-left hover:shadow-md ${
+                        isSelected
+                          ? drive.isSystemDrive
+                            ? "border-amber-500 bg-amber-50 dark:bg-amber-950/20 shadow-sm"
+                            : "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/20 shadow-sm"
+                          : "border-border bg-card hover:border-emerald-300"
                       }`}
                     >
-                      <HardDrive className="h-5 w-5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-semibold text-sm truncate">
-                        {drive.label}
+                      <div
+                        className={`p-2 rounded-lg ${
+                          isSelected
+                            ? drive.isSystemDrive
+                              ? "bg-amber-500 text-white"
+                              : "bg-emerald-500 text-white"
+                            : "bg-muted text-muted-foreground"
+                        }`}
+                      >
+                        {drive.isSystemDrive ? (
+                          <ShieldAlert className="h-5 w-5" />
+                        ) : (
+                          <HardDrive className="h-5 w-5" />
+                        )}
                       </div>
-                      <div className="text-xs text-muted-foreground">
-                        {formatBytes(drive.free)} ว่าง / {formatBytes(drive.total)}
+                      <div className="flex-1 min-w-0">
+                        <div className="font-semibold text-sm truncate flex items-center gap-1.5">
+                          {drive.label}
+                          {drive.isSystemDrive && (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] px-1.5 py-0 border-amber-400 text-amber-600 dark:text-amber-400"
+                            >
+                              SYSTEM
+                            </Badge>
+                          )}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {formatBytes(drive.free)} ว่าง /{" "}
+                          {formatBytes(drive.total)}
+                        </div>
+                        <Progress
+                          value={
+                            drive.total > 0
+                              ? ((drive.total - drive.free) / drive.total) * 100
+                              : 0
+                          }
+                          className="h-1.5 mt-1.5"
+                        />
                       </div>
-                      <Progress
-                        value={
-                          drive.total > 0
-                            ? ((drive.total - drive.free) / drive.total) * 100
-                            : 0
-                        }
-                        className="h-1.5 mt-1.5"
-                      />
-                    </div>
-                  </button>
-                ))}
+                    </button>
+                  );
+                })}
               </div>
 
               {drives.length === 0 && (
@@ -649,7 +716,9 @@ export default function Home() {
                         className="flex-1"
                       />
                       <span className="text-sm font-mono w-16 text-right">
-                        {minFileSizeMB === 0 ? "0" : formatBytes(minFileSizeMB * 1024 * 1024)}
+                        {minFileSizeMB === 0
+                          ? "0"
+                          : formatBytes(minFileSizeMB * 1024 * 1024)}
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground">
@@ -658,10 +727,11 @@ export default function Home() {
                   </div>
 
                   <div className="space-y-3">
-                    <Label className="text-sm font-medium">
-                      ประเภทไฟล์
-                    </Label>
-                    <Select value={fileTypeFilter} onValueChange={setFileTypeFilter}>
+                    <Label className="text-sm font-medium">ประเภทไฟล์</Label>
+                    <Select
+                      value={fileTypeFilter}
+                      onValueChange={setFileTypeFilter}
+                    >
                       <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
@@ -760,318 +830,412 @@ export default function Home() {
           )}
 
           {/* Results */}
-          {scanStatus?.status === "completed" && scanStatus.filesFound.length > 0 && (
-            <>
-              {/* Statistics Cards */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {scanStatus?.status === "completed" &&
+            scanStatus.filesFound.length > 0 && (
+              <>
+                {/* Statistics Cards */}
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                  <Card className="border-0 shadow-md">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-blue-100 dark:bg-blue-900/30">
+                          <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                        </div>
+                        <div>
+                          <p className="text-2xl font-bold">
+                            {stats?.totalFiles || 0}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            ไฟล์ที่พบ
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="border-0 shadow-md">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
+                          <BarChart3 className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <div>
+                          <p className="text-2xl font-bold">
+                            {formatBytes(stats?.totalSize || 0)}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            พื้นที่รวม
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="border-0 shadow-md border-l-4 border-l-amber-400">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
+                          <ShieldAlert className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <div>
+                          <p className="text-2xl font-bold">
+                            {stats?.protectedCount || 0}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            🛡️ ถูกป้องกัน
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="border-0 shadow-md">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-emerald-100 dark:bg-emerald-900/30">
+                          <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                        </div>
+                        <div>
+                          <p className="text-2xl font-bold">
+                            {selectedFiles.size}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            เลือกแล้ว
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="border-0 shadow-md">
+                    <CardContent className="pt-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-red-100 dark:bg-red-900/30">
+                          <Trash2 className="h-5 w-5 text-red-600 dark:text-red-400" />
+                        </div>
+                        <div>
+                          <p className="text-2xl font-bold">
+                            {formatBytes(stats?.selectedSize || 0)}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            พื้นที่ที่จะลบ
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+
+                {/* Type Filter & Actions */}
                 <Card className="border-0 shadow-md">
-                  <CardContent className="pt-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2 rounded-lg bg-blue-100 dark:bg-blue-900/30">
-                        <FileText className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                  <CardHeader className="pb-3">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div className="flex items-center gap-2">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 font-bold text-sm">
+                          2
+                        </div>
+                        <div>
+                          <CardTitle className="text-lg">
+                            ผลการสแกน
+                          </CardTitle>
+                          <CardDescription>
+                            เลือกไฟล์ที่ต้องการลบแล้วกดปุ่มลบ — ไฟล์ที่มี
+                            🛡️ ถูกป้องกันไม่ให้ลบ
+                          </CardDescription>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-2xl font-bold">
-                          {stats?.totalFiles || 0}
-                        </p>
-                        <p className="text-xs text-muted-foreground">ไฟล์ที่พบ</p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Select
+                          value={typeFilter}
+                          onValueChange={setTypeFilter}
+                        >
+                          <SelectTrigger className="w-[160px]">
+                            <SelectValue placeholder="กรองประเภท" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="all">ทุกประเภท</SelectItem>
+                            {uniqueTypes.map((type) => (
+                              <SelectItem key={type} value={type}>
+                                {type} ({stats?.typeCounts[type] || 0})
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              disabled={selectedFiles.size === 0 || isDeleting}
+                              className="gap-1"
+                            >
+                              {isDeleting ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="h-4 w-4" />
+                              )}
+                              ลบ {selectedFiles.size} ไฟล์
+                              {stats?.selectedSize
+                                ? ` (${formatBytes(stats.selectedSize)})`
+                                : ""}
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle className="flex items-center gap-2">
+                                <AlertTriangle className="h-5 w-5 text-destructive" />
+                                ยืนยันการลบไฟล์
+                              </AlertDialogTitle>
+                              <AlertDialogDescription>
+                                คุณกำลังจะลบ{" "}
+                                <strong>{selectedFiles.size} ไฟล์</strong>{" "}
+                                รวมพื้นที่{" "}
+                                <strong>
+                                  {formatBytes(stats?.selectedSize || 0)}
+                                </strong>
+                                <br />
+                                การกระทำนี้
+                                <strong>ไม่สามารถเรียกคืนได้</strong>
+                                ไฟล์จะถูกลบถาวรจากระบบ
+                                <br />
+                                <span className="text-amber-600">
+                                  (ไฟล์ระบบที่ถูกป้องกันจะไม่ถูกลบ)
+                                </span>
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={deleteSelected}
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                              >
+                                ลบถาวร
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={startScan}
+                          disabled={isScanning}
+                          className="gap-1"
+                        >
+                          <RefreshCw className="h-4 w-4" />
+                          สแกนใหม่
+                        </Button>
                       </div>
                     </div>
-                  </CardContent>
-                </Card>
-
-                <Card className="border-0 shadow-md">
-                  <CardContent className="pt-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                        <BarChart3 className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                      </div>
-                      <div>
-                        <p className="text-2xl font-bold">
-                          {formatBytes(stats?.totalSize || 0)}
-                        </p>
-                        <p className="text-xs text-muted-foreground">พื้นที่รวม</p>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-
-                <Card className="border-0 shadow-md">
-                  <CardContent className="pt-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2 rounded-lg bg-emerald-100 dark:bg-emerald-900/30">
-                        <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
-                      </div>
-                      <div>
-                        <p className="text-2xl font-bold">{selectedFiles.size}</p>
-                        <p className="text-xs text-muted-foreground">เลือกแล้ว</p>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-
-                <Card className="border-0 shadow-md">
-                  <CardContent className="pt-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2 rounded-lg bg-red-100 dark:bg-red-900/30">
-                        <Trash2 className="h-5 w-5 text-red-600 dark:text-red-400" />
-                      </div>
-                      <div>
-                        <p className="text-2xl font-bold">
-                          {formatBytes(stats?.selectedSize || 0)}
-                        </p>
-                        <p className="text-xs text-muted-foreground">พื้นที่ที่จะลบ</p>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              </div>
-
-              {/* Type Filter & Actions */}
-              <Card className="border-0 shadow-md">
-                <CardHeader className="pb-3">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 font-bold text-sm">
-                        2
-                      </div>
-                      <div>
-                        <CardTitle className="text-lg">ผลการสแกน</CardTitle>
-                        <CardDescription>
-                          เลือกไฟล์ที่ต้องการลบแล้วกดปุ่มลบ
-                        </CardDescription>
-                      </div>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Select value={typeFilter} onValueChange={setTypeFilter}>
-                        <SelectTrigger className="w-[160px]">
-                          <SelectValue placeholder="กรองประเภท" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="all">ทุกประเภท</SelectItem>
-                          {uniqueTypes.map((type) => (
-                            <SelectItem key={type} value={type}>
-                              {type} ({stats?.typeCounts[type] || 0})
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            disabled={selectedFiles.size === 0 || isDeleting}
-                            className="gap-1"
-                          >
-                            {isDeleting ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Trash2 className="h-4 w-4" />
-                            )}
-                            ลบ {selectedFiles.size} ไฟล์
-                            {stats?.selectedSize
-                              ? ` (${formatBytes(stats.selectedSize)})`
-                              : ""}
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle className="flex items-center gap-2">
-                              <AlertTriangle className="h-5 w-5 text-destructive" />
-                              ยืนยันการลบไฟล์
-                            </AlertDialogTitle>
-                            <AlertDialogDescription>
-                              คุณกำลังจะลบ <strong>{selectedFiles.size} ไฟล์</strong>{" "}
-                              รวมพื้นที่{" "}
-                              <strong>{formatBytes(stats?.selectedSize || 0)}</strong>
-                              <br />
-                              การกระทำนี้<strong>ไม่สามารถเรียกคืนได้</strong>
-                              ไฟล์จะถูกลบถาวรจากระบบ
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
-                            <AlertDialogAction
-                              onClick={deleteSelected}
-                              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                            >
-                              ลบถาวร
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={startScan}
-                        disabled={isScanning}
-                        className="gap-1"
-                      >
-                        <RefreshCw className="h-4 w-4" />
-                        สแกนใหม่
-                      </Button>
-                    </div>
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  {/* File Table */}
-                  <div className="rounded-xl border overflow-hidden">
-                    <div className="max-h-[500px] overflow-y-auto">
-                      <Table>
-                        <TableHeader className="sticky top-0 bg-muted/50 backdrop-blur-sm z-10">
-                          <TableRow>
-                            <TableHead className="w-12">
-                              <Checkbox
-                                checked={
-                                  filteredFiles.length > 0 &&
-                                  selectedFiles.size === filteredFiles.length
-                                }
-                                onCheckedChange={toggleAllFiles}
-                              />
-                            </TableHead>
-                            <TableHead
-                              className="cursor-pointer hover:bg-muted/80"
-                              onClick={() => handleSort("name")}
-                            >
-                              <span className="flex items-center">
-                                ชื่อไฟล์ <SortIcon field="name" />
-                              </span>
-                            </TableHead>
-                            <TableHead
-                              className="cursor-pointer hover:bg-muted/80"
-                              onClick={() => handleSort("size")}
-                            >
-                              <span className="flex items-center">
-                                ขนาด <SortIcon field="size" />
-                              </span>
-                            </TableHead>
-                            <TableHead
-                              className="cursor-pointer hover:bg-muted/80"
-                              onClick={() => handleSort("type")}
-                            >
-                              <span className="flex items-center">
-                                ประเภท <SortIcon field="type" />
-                              </span>
-                            </TableHead>
-                            <TableHead
-                              className="cursor-pointer hover:bg-muted/80"
-                              onClick={() => handleSort("daysSinceAccess")}
-                            >
-                              <span className="flex items-center">
-                                ไม่ได้ใช้ (วัน) <SortIcon field="daysSinceAccess" />
-                              </span>
-                            </TableHead>
-                            <TableHead
-                              className="cursor-pointer hover:bg-muted/80 hidden md:table-cell"
-                              onClick={() => handleSort("daysSinceModified")}
-                            >
-                              <span className="flex items-center">
-                                แก้ไขล่าสุด <SortIcon field="daysSinceModified" />
-                              </span>
-                            </TableHead>
-                            <TableHead className="hidden lg:table-cell">
-                              ตำแหน่ง
-                            </TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {filteredFiles.map((file) => (
-                            <TableRow
-                              key={file.id}
-                              className={`hover:bg-muted/50 cursor-pointer transition-colors ${
-                                selectedFiles.has(file.path)
-                                  ? "bg-red-50/50 dark:bg-red-950/10"
-                                  : ""
-                              }`}
-                              onClick={() => toggleFile(file.path)}
-                            >
-                              <TableCell onClick={(e) => e.stopPropagation()}>
+                  </CardHeader>
+                  <CardContent>
+                    {/* File Table */}
+                    <div className="rounded-xl border overflow-hidden">
+                      <div className="max-h-[500px] overflow-y-auto">
+                        <Table>
+                          <TableHeader className="sticky top-0 bg-muted/50 backdrop-blur-sm z-10">
+                            <TableRow>
+                              <TableHead className="w-12">
                                 <Checkbox
-                                  checked={selectedFiles.has(file.path)}
-                                  onCheckedChange={() => toggleFile(file.path)}
+                                  checked={
+                                    filteredFiles.filter((f) => !f.isProtected)
+                                      .length > 0 &&
+                                    selectedFiles.size ===
+                                      filteredFiles.filter(
+                                        (f) => !f.isProtected
+                                      ).length
+                                  }
+                                  onCheckedChange={toggleAllFiles}
                                 />
-                              </TableCell>
-                              <TableCell>
-                                <div className="flex items-center gap-2">
-                                  <File className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                                  <span className="font-medium text-sm truncate max-w-[200px]">
-                                    {file.name}
-                                  </span>
-                                  <span className="text-xs text-muted-foreground">
-                                    {file.extension}
-                                  </span>
-                                </div>
-                              </TableCell>
-                              <TableCell className="font-mono text-sm">
-                                {formatBytes(file.size)}
-                              </TableCell>
-                              <TableCell>
-                                <Badge
-                                  variant={getTypeBadgeVariant(file.type)}
-                                  className="text-xs"
-                                >
-                                  {file.type}
-                                </Badge>
-                              </TableCell>
-                              <TableCell>
-                                <span
-                                  className={`font-semibold text-sm ${getDaysColor(
-                                    file.daysSinceAccess
-                                  )}`}
-                                >
-                                  {file.daysSinceAccess}
+                              </TableHead>
+                              <TableHead
+                                className="cursor-pointer hover:bg-muted/80"
+                                onClick={() => handleSort("name")}
+                              >
+                                <span className="flex items-center">
+                                  ชื่อไฟล์ <SortIcon field="name" />
                                 </span>
-                                <span className="text-xs text-muted-foreground ml-1">
-                                  วัน
+                              </TableHead>
+                              <TableHead
+                                className="cursor-pointer hover:bg-muted/80"
+                                onClick={() => handleSort("size")}
+                              >
+                                <span className="flex items-center">
+                                  ขนาด <SortIcon field="size" />
                                 </span>
-                              </TableCell>
-                              <TableCell className="hidden md:table-cell">
-                                <span
-                                  className={`text-sm ${getDaysColor(
-                                    file.daysSinceModified
-                                  )}`}
-                                >
-                                  {file.daysSinceModified}
+                              </TableHead>
+                              <TableHead
+                                className="cursor-pointer hover:bg-muted/80"
+                                onClick={() => handleSort("type")}
+                              >
+                                <span className="flex items-center">
+                                  ประเภท <SortIcon field="type" />
                                 </span>
-                                <span className="text-xs text-muted-foreground ml-1">
-                                  วัน
+                              </TableHead>
+                              <TableHead
+                                className="cursor-pointer hover:bg-muted/80"
+                                onClick={() => handleSort("daysSinceAccess")}
+                              >
+                                <span className="flex items-center">
+                                  ไม่ได้ใช้ (วัน){" "}
+                                  <SortIcon field="daysSinceAccess" />
                                 </span>
-                              </TableCell>
-                              <TableCell className="hidden lg:table-cell">
-                                <Tooltip>
-                                  <TooltipTrigger>
-                                    <span className="text-xs text-muted-foreground truncate max-w-[200px] block">
-                                      {file.path}
-                                    </span>
-                                  </TooltipTrigger>
-                                  <TooltipContent className="max-w-sm break-all">
-                                    {file.path}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TableCell>
+                              </TableHead>
+                              <TableHead
+                                className="cursor-pointer hover:bg-muted/80 hidden md:table-cell"
+                                onClick={() => handleSort("daysSinceModified")}
+                              >
+                                <span className="flex items-center">
+                                  แก้ไขล่าสุด{" "}
+                                  <SortIcon field="daysSinceModified" />
+                                </span>
+                              </TableHead>
+                              <TableHead className="hidden lg:table-cell">
+                                ตำแหน่ง
+                              </TableHead>
+                              <TableHead className="w-16 text-center">
+                                สถานะ
+                              </TableHead>
                             </TableRow>
-                          ))}
-                        </TableBody>
-                      </Table>
+                          </TableHeader>
+                          <TableBody>
+                            {filteredFiles.map((file) => (
+                              <TableRow
+                                key={file.id}
+                                className={`transition-colors ${
+                                  file.isProtected
+                                    ? "bg-amber-50/50 dark:bg-amber-950/10 cursor-not-allowed opacity-80"
+                                    : selectedFiles.has(file.path)
+                                    ? "bg-red-50/50 dark:bg-red-950/10 cursor-pointer hover:bg-muted/50"
+                                    : "cursor-pointer hover:bg-muted/50"
+                                }`}
+                                onClick={() =>
+                                  toggleFile(file.path, file.isProtected)
+                                }
+                              >
+                                <TableCell
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <Checkbox
+                                    checked={selectedFiles.has(file.path)}
+                                    onCheckedChange={() =>
+                                      toggleFile(file.path, file.isProtected)
+                                    }
+                                    disabled={file.isProtected}
+                                  />
+                                </TableCell>
+                                <TableCell>
+                                  <div className="flex items-center gap-2">
+                                    <File className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                                    <span className="font-medium text-sm truncate max-w-[200px]">
+                                      {file.name}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground">
+                                      {file.extension}
+                                    </span>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="font-mono text-sm">
+                                  {formatBytes(file.size)}
+                                </TableCell>
+                                <TableCell>
+                                  <Badge
+                                    variant={getTypeBadgeVariant(file.type)}
+                                    className="text-xs"
+                                  >
+                                    {file.type}
+                                  </Badge>
+                                </TableCell>
+                                <TableCell>
+                                  <span
+                                    className={`font-semibold text-sm ${getDaysColor(
+                                      file.daysSinceAccess
+                                    )}`}
+                                  >
+                                    {file.daysSinceAccess}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground ml-1">
+                                    วัน
+                                  </span>
+                                </TableCell>
+                                <TableCell className="hidden md:table-cell">
+                                  <span
+                                    className={`text-sm ${getDaysColor(
+                                      file.daysSinceModified
+                                    )}`}
+                                  >
+                                    {file.daysSinceModified}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground ml-1">
+                                    วัน
+                                  </span>
+                                </TableCell>
+                                <TableCell className="hidden lg:table-cell">
+                                  <Tooltip>
+                                    <TooltipTrigger>
+                                      <span className="text-xs text-muted-foreground truncate max-w-[200px] block">
+                                        {file.path}
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent className="max-w-sm break-all">
+                                      {file.path}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </TableCell>
+                                <TableCell className="text-center">
+                                  {file.isProtected ? (
+                                    <Tooltip>
+                                      <TooltipTrigger>
+                                        <div className="flex items-center justify-center">
+                                          <ShieldAlert className="h-4 w-4 text-amber-500" />
+                                        </div>
+                                      </TooltipTrigger>
+                                      <TooltipContent className="max-w-xs">
+                                        <p className="font-semibold text-amber-500">
+                                          🛡️ ไฟล์ถูกป้องกัน
+                                        </p>
+                                        <p className="text-xs mt-1">
+                                          {file.protectionReason ||
+                                            "ไฟล์ระบบ — ห้ามลบ"}
+                                        </p>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  ) : (
+                                    <Tooltip>
+                                      <TooltipTrigger>
+                                        <div className="flex items-center justify-center">
+                                          <Lock
+                                            className="h-4 w-4 text-muted-foreground opacity-0"
+                                          />
+                                        </div>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        สามารถลบได้
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </div>
                     </div>
-                  </div>
 
-                  {filteredFiles.length === 0 && (
-                    <div className="text-center py-12 text-muted-foreground">
-                      <File className="h-16 w-16 mx-auto mb-3 opacity-30" />
-                      <p className="text-lg font-medium">ไม่พบไฟล์</p>
-                      <p className="text-sm">
-                        ลองปรับเงื่อนไขการค้นหาหรือสแกนใหม่
-                      </p>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </>
-          )}
+                    {filteredFiles.length === 0 && (
+                      <div className="text-center py-12 text-muted-foreground">
+                        <File className="h-16 w-16 mx-auto mb-3 opacity-30" />
+                        <p className="text-lg font-medium">ไม่พบไฟล์</p>
+                        <p className="text-sm">
+                          ลองปรับเงื่อนไขการค้นหาหรือสแกนใหม่
+                        </p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </>
+            )}
 
           {/* No results state */}
           {scanStatus?.status === "completed" &&
@@ -1080,7 +1244,9 @@ export default function Home() {
                 <CardContent className="py-12">
                   <div className="text-center space-y-3">
                     <CheckCircle2 className="h-16 w-16 mx-auto text-emerald-500" />
-                    <h3 className="text-xl font-semibold">เครื่องของคุณสะอาดดี!</h3>
+                    <h3 className="text-xl font-semibold">
+                      เครื่องของคุณสะอาดดี!
+                    </h3>
                     <p className="text-muted-foreground max-w-md mx-auto">
                       ไม่พบไฟล์ที่ไม่ได้ใช้ตามเงื่อนไขที่ตั้งไว้
                       ลองปรับลดจำนวนวันหรือขนาดไฟล์ขั้นต่ำแล้วสแกนใหม่
@@ -1110,7 +1276,11 @@ export default function Home() {
                   <p className="text-muted-foreground">
                     {scanStatus.error || "Unknown error"}
                   </p>
-                  <Button variant="outline" onClick={startScan} className="gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={startScan}
+                    className="gap-2"
+                  >
                     <RefreshCw className="h-4 w-4" />
                     ลองอีกครั้ง
                   </Button>
@@ -1158,9 +1328,9 @@ export default function Home() {
                     </div>
                   </div>
                   <div className="flex items-center justify-center gap-2 text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/20 p-3 rounded-lg">
-                    <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                    <ShieldAlert className="h-4 w-4 flex-shrink-0" />
                     <span>
-                      ควรตรวจสอบไฟล์ให้แน่ใจก่อนลบ — การลบเป็นถาวรและไม่สามารถเรียกคืนได้
+                      ไฟล์ระบบ Windows และไฟล์สำคัญจะถูกป้องกันไม่ให้ลบ — ปลอดภัย 100%
                     </span>
                   </div>
                 </div>
@@ -1173,10 +1343,10 @@ export default function Home() {
         <footer className="mt-auto border-t bg-white/80 dark:bg-slate-950/80 backdrop-blur-md">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
             <div className="flex flex-col sm:flex-row items-center justify-between gap-2 text-sm text-muted-foreground">
-              <span>File Scanner & Cleaner — ค้นหาและลบไฟล์ไม่ได้ใช้</span>
+              <span>Copyright &copy; 2026 Pendogy</span>
               <div className="flex items-center gap-1">
-                <Shield className="h-3.5 w-3.5" />
-                <span>ข้อมูลจะไม่ถูกส่งออกนอกเครื่อง</span>
+                <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
+                <span>ป้องกันไฟล์ระบบ Windows อัตโนมัติ</span>
               </div>
             </div>
           </div>
